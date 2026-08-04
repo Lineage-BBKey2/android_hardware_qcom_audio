@@ -1813,23 +1813,6 @@ static void check_usecases_capture_codec_backend(struct audio_device *adev,
     }
 
     if (num_uc_to_switch) {
-        /* Close PCM handles for active capture streams before rerouting.
-         * Tearing down the snd_device while a PCM handle is open causes
-         * pcm_read() to return errors, triggering a standby/restart loop. */
-        list_for_each(node, &adev->usecase_list) {
-            usecase = node_to_item(node, struct audio_usecase, list);
-            if (switch_device[usecase->id] && usecase->type == PCM_CAPTURE &&
-                usecase->stream.in && !usecase->stream.in->standby) {
-                struct stream_in *in = usecase->stream.in;
-                ALOGD("%s: closing PCM for capture usecase %s before reroute",
-                      __func__, use_case_table[usecase->id]);
-                in->standby = true;
-                if (in->pcm) {
-                    pcm_close(in->pcm);
-                    in->pcm = NULL;
-                }
-            }
-        }
 
         /* All streams have been de-routed. Disable the device */
 
@@ -2941,6 +2924,26 @@ int start_input_stream(struct stream_in *in)
     }
 
     struct audio_device *adev = in->dev;
+    /*
+     * Athena's legacy capture backend cannot run software hotword/voice
+     * recognition concurrently with the cellular voice TX PCM.
+     *
+     * Hardware sound-trigger sessions are excluded because STHAL receives
+     * the existing voice-call activity notifications.
+     */
+    if (adev->mode == AUDIO_MODE_IN_CALL &&
+        !in->is_st_session &&
+        (in->source == AUDIO_SOURCE_HOTWORD ||
+         in->source == AUDIO_SOURCE_VOICE_RECOGNITION)) {
+        ALOGV("%s: deferring software VA capture during cellular call: "
+              "stream=%p source=%d usecase=%d(%s)",
+              __func__,
+              &in->stream,
+              in->source,
+              in->usecase,
+              use_case_table[in->usecase]);
+        return -EBUSY;
+    }
     struct pcm_config config = in->config;
     int usecase = platform_update_usecase_from_source(in->source,in->usecase);
 
@@ -2971,9 +2974,44 @@ int start_input_stream(struct stream_in *in)
     else
         ALOGV("%s: usecase(%d)", __func__, in->usecase);
 
-    if (get_usecase_from_list(adev, in->usecase) != NULL) {
-        ALOGE("%s: use case assigned already in use, stream(%p)usecase(%d: %s)",
-            __func__, &in->stream, in->usecase, use_case_table[in->usecase]);
+    struct audio_usecase *existing_uc =
+        get_usecase_from_list(adev, in->usecase);
+
+    if (existing_uc != NULL) {
+        struct stream_in *existing_in = existing_uc->stream.in;
+
+        ALOGE("%s: duplicate capture usecase %d(%s): "
+              "incoming_stream=%p source=%d standby=%d "
+              "is_st_session=%d is_st_session_active=%d "
+              "capture_handle=%d device=%#x pcm=%p; "
+              "existing_stream=%p source=%d standby=%d "
+              "is_st_session=%d is_st_session_active=%d "
+              "capture_handle=%d device=%#x pcm=%p; "
+              "mode=%d",
+              __func__,
+              in->usecase,
+              use_case_table[in->usecase],
+
+              &in->stream,
+              in->source,
+              in->standby,
+              in->is_st_session,
+              in->is_st_session_active,
+              in->capture_handle,
+              in->device,
+              in->pcm,
+
+              existing_in ? &existing_in->stream : NULL,
+              existing_in ? existing_in->source : -1,
+              existing_in ? existing_in->standby : -1,
+              existing_in ? existing_in->is_st_session : -1,
+              existing_in ? existing_in->is_st_session_active : -1,
+              existing_in ? existing_in->capture_handle : -1,
+              existing_in ? existing_in->device : AUDIO_DEVICE_NONE,
+              existing_in ? existing_in->pcm : NULL,
+
+              adev->mode);
+
         return -EINVAL;
     }
 
@@ -6435,6 +6473,63 @@ static int in_dump(const struct audio_stream *stream,
     return 0;
 }
 
+static void standby_software_va_inputs_for_call(struct audio_device *adev)
+{
+    struct listnode *node;
+    struct audio_usecase *usecase;
+    struct stream_in *in;
+    int status;
+
+    for (;;) {
+        in = NULL;
+
+        /*
+         * Only use adev->lock to locate one active input. Do not call
+         * in_standby() while holding it because in_standby() acquires
+         * in->lock first and then adev->lock.
+         */
+        pthread_mutex_lock(&adev->lock);
+
+        list_for_each(node, &adev->usecase_list) {
+            usecase = node_to_item(node, struct audio_usecase, list);
+
+            if (usecase->type != PCM_CAPTURE ||
+                usecase->stream.in == NULL)
+                continue;
+
+            if (!usecase->stream.in->is_st_session &&
+                !usecase->stream.in->standby &&
+                (usecase->stream.in->source ==
+                     AUDIO_SOURCE_HOTWORD ||
+                 usecase->stream.in->source ==
+                     AUDIO_SOURCE_VOICE_RECOGNITION)) {
+                in = usecase->stream.in;
+                break;
+            }
+        }
+
+        pthread_mutex_unlock(&adev->lock);
+
+        if (in == NULL)
+            break;
+
+        ALOGD("%s: placing software VA input into standby for call: "
+              "stream=%p source=%d usecase=%d(%s)",
+              __func__,
+              &in->stream,
+              in->source,
+              in->usecase,
+              use_case_table[in->usecase]);
+
+        status = in_standby(&in->stream.common);
+        if (status != 0) {
+            ALOGE("%s: failed to stop software VA input: %d",
+                  __func__, status);
+            break;
+        }
+    }
+}
+
 static void in_snd_mon_cb(void * stream, struct str_parms * parms)
 {
     if (!stream || !parms)
@@ -6675,6 +6770,40 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
         !in->standby && adev->adm_routing_changed) {
         ret = -ENOSYS;
         goto exit;
+    }
+
+    /*
+     * Software hotword/voice-recognition capture cannot share Athena's
+     * capture backend with cellular voice TX. While the call owns that
+     * backend, return paced silence without repeatedly attempting to
+     * reopen the capture PCM.
+     */
+    if (in->standby &&
+        adev->mode == AUDIO_MODE_IN_CALL &&
+        !in->is_st_session &&
+        (in->source == AUDIO_SOURCE_HOTWORD ||
+         in->source == AUDIO_SOURCE_VOICE_RECOGNITION)) {
+        const uint32_t sample_rate =
+                in_get_sample_rate(&in->stream.common);
+
+        frame_size = audio_stream_in_frame_size(stream);
+        memset(buffer, 0, bytes);
+        bytes_read = bytes;
+
+        if (frame_size > 0)
+            in->frames_read += bytes / frame_size;
+
+        pthread_mutex_unlock(&in->lock);
+
+        /*
+         * Emulate normal capture pacing so the client does not busy-loop.
+         */
+        if (frame_size > 0 && sample_rate > 0) {
+            usleep((uint64_t)bytes * 1000000ULL /
+                   frame_size / sample_rate);
+        }
+
+        return bytes_read;
     }
 
     if (in->standby) {
@@ -8612,6 +8741,7 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
     struct listnode *node;
     struct audio_usecase *usecase = NULL;
     int ret = 0;
+    bool entering_call = false;
 
     pthread_mutex_lock(&adev->lock);
     if (adev->mode != mode) {
@@ -8619,6 +8749,7 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
         if (amplifier_set_mode(mode) != 0)
             ALOGE("Failed setting amplifier mode");
         adev->mode = mode;
+        entering_call = (mode == AUDIO_MODE_IN_CALL);
         if (voice_is_in_call(adev) &&
             (mode == AUDIO_MODE_NORMAL ||
              (mode == AUDIO_MODE_IN_COMMUNICATION && !voice_is_call_state_active(adev)))) {
@@ -8651,6 +8782,8 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
         }
     }
     pthread_mutex_unlock(&adev->lock);
+    if (entering_call)
+        standby_software_va_inputs_for_call(adev);
     return 0;
 }
 
