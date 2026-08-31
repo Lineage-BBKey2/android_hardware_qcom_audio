@@ -2096,6 +2096,24 @@ static void check_usecases_capture_codec_backend(struct audio_device *adev,
     }
 
     if (num_uc_to_switch) {
+        /* Close PCM handles for active capture streams before rerouting.
+         * Tearing down the snd_device while a PCM handle is open causes
+         * pcm_read() to return errors, triggering a standby/restart loop. */
+        list_for_each(node, &adev->usecase_list) {
+            usecase = node_to_item(node, struct audio_usecase, list);
+            if (switch_device[usecase->id] && usecase->type == PCM_CAPTURE &&
+                usecase->stream.in && !usecase->stream.in->standby) {
+                struct stream_in *in = usecase->stream.in;
+                ALOGD("%s: closing PCM for capture usecase %s before reroute",
+                      __func__, use_case_table[usecase->id]);
+                in->standby = true;
+                if (in->pcm) {
+                    pcm_close(in->pcm);
+                    in->pcm = NULL;
+                }
+            }
+        }
+
         /* All streams have been de-routed. Disable the device */
 
         /* Make sure the previous devices to be disabled first and then enable the
@@ -3053,13 +3071,14 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
     }
 
     /* Disable current sound devices */
-    if (usecase->out_snd_device != SND_DEVICE_NONE) {
+    if (usecase->out_snd_device != SND_DEVICE_NONE ||
+        usecase->in_snd_device != SND_DEVICE_NONE) {
         disable_audio_route(adev, usecase);
+    }
+    if (usecase->out_snd_device != SND_DEVICE_NONE) {
         disable_snd_device(adev, usecase->out_snd_device);
     }
-
     if (usecase->in_snd_device != SND_DEVICE_NONE) {
-        disable_audio_route(adev, usecase);
         disable_snd_device(adev, usecase->in_snd_device);
     }
 
@@ -5126,7 +5145,14 @@ int route_output_stream(struct stream_out *out,
                                                 out->handle);
             }
             if (!bypass_a2dp) {
-                select_devices(adev, out->usecase);
+                /* Don't override BT SCO voice routing with non-call stream routing */
+                if (adev->bt_sco_on && voice_is_in_call(adev) &&
+                    !output_drives_call(adev, out)) {
+                    ALOGD("%s: BT SCO active during call, skipping select_devices for usecase %d",
+                          __func__, out->usecase);
+                } else {
+                    select_devices(adev, out->usecase);
+                }
             } else {
                 if (compare_device_type(&new_devices, AUDIO_DEVICE_OUT_SPEAKER_SAFE))
                     reassign_device_list(&out->device_list, AUDIO_DEVICE_OUT_SPEAKER_SAFE, "");
@@ -8913,9 +8939,21 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
                      select_devices(adev, usecase->id);
                     }
             }
+            if (voice_is_in_call(adev) && adev->current_call_output != NULL) {
+                ALOGD("BT_SCO ON during active call, rerouting voice usecases");
+                reassign_device_list(&adev->current_call_output->device_list,
+                                     AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET, "");
+                voice_update_devices_for_all_voice_usecases(adev);
+            }
          }
          else {
             adev->bt_sco_on = false;
+            if (voice_is_in_call(adev) && adev->current_call_output != NULL) {
+                ALOGD("BT_SCO OFF during active call, rerouting voice usecases");
+                reassign_device_list(&adev->current_call_output->device_list,
+                                     AUDIO_DEVICE_OUT_EARPIECE, "");
+                voice_update_devices_for_all_voice_usecases(adev);
+            }
             audio_extn_sco_reset_configuration();
         }
     }

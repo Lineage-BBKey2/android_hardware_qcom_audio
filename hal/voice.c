@@ -863,7 +863,7 @@ void voice_update_devices_for_all_voice_usecases(struct audio_device *adev)
 
     list_for_each(node, &adev->usecase_list) {
         usecase = node_to_item(node, struct audio_usecase, list);
-        if (usecase->type == VOICE_CALL) {
+        if (usecase->type == VOICE_CALL || usecase->type == VOIP_CALL) {
             ALOGV("%s: updating device for usecase:%s", __func__,
                   use_case_table[usecase->id]);
             usecase->stream.out = adev->current_call_output;
