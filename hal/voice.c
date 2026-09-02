@@ -347,15 +347,33 @@ int voice_start_usecase(struct audio_device *adev, audio_usecase_t usecase_id)
 
     ret = pcm_start(session->pcm_tx);
     if (ret != 0) {
-        ALOGE("%s: %s", __func__, pcm_get_error(session->pcm_tx));
+        ALOGE("%s: TX pcm_start failed: "
+              "card=%d device=%d ret=%d error=%s",
+              __func__,
+              adev->snd_card,
+              pcm_dev_tx_id,
+              ret,
+              pcm_get_error(session->pcm_tx));
         goto error_start_voice;
     }
 
+    ALOGD("%s: TX pcm_start succeeded: card=%d device=%d",
+          __func__, adev->snd_card, pcm_dev_tx_id);
+
     ret = pcm_start(session->pcm_rx);
     if (ret != 0) {
-        ALOGE("%s: %s", __func__, pcm_get_error(session->pcm_rx));
+        ALOGE("%s: RX pcm_start failed: "
+              "card=%d device=%d ret=%d error=%s",
+              __func__,
+              adev->snd_card,
+              pcm_dev_rx_id,
+              ret,
+              pcm_get_error(session->pcm_rx));
         goto error_start_voice;
     }
+
+    ALOGD("%s: RX pcm_start succeeded: card=%d device=%d",
+          __func__, adev->snd_card, pcm_dev_rx_id);
 
 #ifdef PLATFORM_AUTO
     ret = pcm_start(voice_loopback_tx);
