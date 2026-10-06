@@ -9094,6 +9094,14 @@ void platform_set_audio_source_delay(audio_source_t audio_source, int delay_ms)
 /* Delay in Us */
 int64_t platform_get_audio_source_delay(audio_source_t audio_source)
 {
+    /*
+     * AUDIO_SOURCE_FM_TUNER is a valid special source outside the
+     * contiguous AUDIO_SOURCE_DEFAULT..AUDIO_SOURCE_MAX range. No
+     * platform-specific capture delay is configured for it.
+     */
+    if (audio_source == AUDIO_SOURCE_FM_TUNER)
+        return 0;
+
     if (audio_source == AUDIO_SOURCE_ECHO_REFERENCE) {
         /* return 0 because audio source delay is not
         currently implemented on automotive in the
