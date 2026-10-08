@@ -924,7 +924,8 @@ void audio_extn_utils_update_stream_app_type_cfg_for_usecase(
     case PCM_CAPTURE:
         if (usecase->id == USECASE_AUDIO_RECORD_VOIP
                               || usecase->id == USECASE_AUDIO_RECORD_VOIP_LOW_LATENCY)
-            usecase->stream.in->app_type_cfg.app_type = APP_TYPE_VOIP_AUDIO;
+            usecase->stream.in->app_type_cfg.app_type =
+                platform_get_default_app_type_v2(adev->platform, PCM_CAPTURE);
         else
             audio_extn_utils_update_stream_input_app_type_cfg(adev->platform,
                                                 &adev->streams_input_cfg_list,
